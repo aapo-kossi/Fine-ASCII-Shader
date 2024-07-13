@@ -23,11 +23,15 @@
 static const uint ASCIICharacters = 64;
 static const uint ASCIIWidth = 8;
 static const uint ASCIIHeight = 8;
-static const uint sharedBufferSize = ASCIIWidth * (ASCIIHeight / 2);
 
 // Modifiable, but requires recompilation
-// Not intended to be increased over 16 without additional considerations
+// Cannot be increased over 16 without additional considerations
+// (Shader does compile with 32 alternatives, but some memory accesses seem to go wrong)
 static const uint ASCIIAlternatives = 16;
+
+// Internal constants
+static const uint PatchSizeBestASCII = 2;
+static const uint sharedBufferSize = ASCIIWidth * (ASCIIHeight / 2);
 
 // Configuration
 uniform uint _Metric <
@@ -102,15 +106,15 @@ sampler2D samplerLumi{ Texture = texLumi; AddressU = BORDER; AddressV = BORDER; 
 //sampler2D samplerILumi { Texture = texILumi; AddressU = BORDER; AddressV = BORDER; MagFilter = POINT; MinFilter = POINT; MipFilter = POINT; };
 // storage2D s_ILumi { Texture = texILumi; };
 
-texture3D texDownscaleInput { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Depth = 16; Format = R16F; };
+texture3D texDownscaleInput { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Depth = ASCIIAlternatives; Format = R16F; };
 sampler3D samplerDownscaleInput { Texture = texDownscaleInput; AddressU = BORDER; AddressV = BORDER; MagFilter = POINT; MinFilter = POINT; MipFilter = POINT;};
 storage3D s_DownscaleInput { Texture = texDownscaleInput; };
 
-texture3D texDownscaled { Width = BUFFER_WIDTH / 8; Height = BUFFER_HEIGHT / 8; Depth = 16; Format = R16F; };
+texture3D texDownscaled { Width = BUFFER_WIDTH / ASCIIWidth; Height = BUFFER_HEIGHT / ASCIIHeight; Depth = ASCIIAlternatives; Format = R16F; };
 sampler3D samplerDownscaled { Texture = texDownscaled; AddressU = BORDER; AddressV = BORDER; MagFilter = POINT; MinFilter = POINT; MipFilter = POINT;};
 storage3D s_Downscaled { Texture = texDownscaled; };
 
-texture2D texDownscaledLumi { Width = BUFFER_WIDTH / 8; Height = BUFFER_HEIGHT / 8; Format = R16F; };
+texture2D texDownscaledLumi { Width = BUFFER_WIDTH / ASCIIWidth; Height = BUFFER_HEIGHT / ASCIIHeight; Format = R16F; };
 sampler2D samplerDownscaledLumi { Texture = texDownscaledLumi; AddressU = BORDER; AddressV = BORDER; MagFilter = POINT; MinFilter = POINT; MipFilter = POINT;};
 storage2D s_DownscaledLumi { Texture = texDownscaledLumi; };
 
@@ -161,10 +165,9 @@ void ComputeDownscaleLumi(uint3 gid : SV_GROUPTHREADID, uint3 id : SV_GROUPID) {
     );
 
     // parallel reduction
-	for ( int i=log2(sharedBufferSize)-1 ; i>=0 ; i-- ) {
+	for ( int i=sharedBufferSize/2 ; i>0 ; i>>=1) {
 		barrier();
-		uint offset = pow(2,i);
-		reductionBuffer[sharedAddr] += reductionBuffer[sharedAddr + offset];
+		reductionBuffer[sharedAddr] += reductionBuffer[sharedAddr + i];
 	}
 
     if (sharedAddr == 0) {
@@ -172,58 +175,83 @@ void ComputeDownscaleLumi(uint3 gid : SV_GROUPTHREADID, uint3 id : SV_GROUPID) {
     }
 }
 
+// This pixel shader is the bottleneck of the pipeline
 void ComputeASCIICloseness(uint3 tid : SV_DISPATCHTHREADID, uint3 gid : SV_GROUPTHREADID, uint3 id : SV_GROUPID) {
 
 	// group thread id is the position inside the 8x8 ascii character
     uint2 ij = gid.xy;
 
-    //uint iLumi = (uint)tex2Dfetch(samplerILumi, id.xy).r;
 	uint iLumi = (uint)tex2Dfetch(samplerDownscaledLumi, id.xy);
 
-    uint comp = id.z + iLumi;
+    uint comp = tid.z + iLumi;
     uint2 posASCII = uint2(comp * ASCIIWidth + gid.x, gid.y);
     float lumiASCII = tex2Dfetch(PixelsASCII, posASCII).r;
     float pixelDistance = abs(lumiASCII - tex2Dfetch(samplerLumi, tid.xy).r);
     pixelDistance = pow(pixelDistance, _Metric);
-    tex3Dstore(s_DownscaleInput, uint3(tid.xy, id.z), pixelDistance);
+    tex3Dstore(s_DownscaleInput, tid, pixelDistance);
 }
 
+groupshared float DownscaleBuffer[sharedBufferSize];
 [numthreads(ASCIIWidth, ASCIIHeight / 2, 1)]
 void ComputeDownscaleWxHxN(uint3 gid : SV_GROUPTHREADID, uint3 id : SV_GROUPID) {
     uint sharedAddr = gid.x + gid.y*ASCIIWidth;
     uint3 inputIdx = uint3(id.xy * uint2(ASCIIWidth, ASCIIHeight) + gid.xy, id.z);
-    reductionBuffer[sharedAddr] = 0.5 * (
+
+    // It would be slightly faster to perform one more set of additions here, but
+    // that seems not worth it
+    DownscaleBuffer[sharedAddr] = 0.5 * (
         tex3Dfetch(samplerDownscaleInput, inputIdx).r
         + tex3Dfetch(samplerDownscaleInput, inputIdx + uint3(0,4,0)).r
     );
+    // uint firstVal = (uint)(tex3Dfetch(samplerDownscaleInput, inputIdx).r * 128);
+    // uint secondVal= (uint)(tex3Dfetch(samplerDownscaleInput, inputIdx + uint3(0,4,0)).r * 128);
+    // uint start = (firstVal + secondVal)>>1;
+    // DownscaleBuffer[sharedAddr] = start;
 
-    // parallel reduction
-	for ( int i=log2(sharedBufferSize)-1 ; i>=0 ; i-- ) {
-		barrier();
-		uint offset = pow(2,i);
-		reductionBuffer[sharedAddr] += reductionBuffer[sharedAddr + offset];
-		reductionBuffer[sharedAddr] = 0.5*reductionBuffer[sharedAddr];
+    // parallel reduction, with CUDA we could warp sync but here a barrier
+    // is required. (Effectively identical performance to the quantized atomicAdd version)
+    [unroll]
+	for ( int i=sharedBufferSize/2 ; i>0 ; i>>=1) {
+		groupMemoryBarrier();
+		DownscaleBuffer[sharedAddr] += DownscaleBuffer[sharedAddr + i];
+		DownscaleBuffer[sharedAddr] = 0.5*DownscaleBuffer[sharedAddr];
+        // DownscaleBuffer[sharedAddr] = atomicAdd(DownscaleBuffer[sharedAddr], DownscaleBuffer[sharedAddr + i])>>1;
 	}
 
     if (sharedAddr == 0) {
-        tex3Dstore(s_Downscaled, id, reductionBuffer[0]);
+        tex3Dstore(s_Downscaled, id, DownscaleBuffer[0]);
     }
 }
 
-void ComputeBestASCII(uint3 tid : SV_DISPATCHTHREADID) {
+groupshared float Closeness[PatchSizeBestASCII*PatchSizeBestASCII*ASCIIAlternatives/2];
+groupshared uint IClosest[PatchSizeBestASCII*PatchSizeBestASCII*ASCIIAlternatives/2];
+[numthreads(PatchSizeBestASCII,PatchSizeBestASCII,ASCIIAlternatives/2)]
+void ComputeBestASCII(uint3 tid : SV_DISPATCHTHREADID, uint3 gid : SV_GROUPTHREADID) {
 
-    uint result = 0;
-    float prevCloseness = tex3Dfetch(samplerDownscaled, uint3(tid.xy,0)).r;
-    for (uint i = 1; i < ASCIIAlternatives; i+=1 ) {
-        uint3 newInd = uint3(tid.xy, i);
-        float newCloseness = tex3Dfetch(samplerDownscaled, newInd).r;
-        if (newCloseness < prevCloseness) {
-            prevCloseness = newCloseness;
-            result = i;
-        }
+    float prevCloseness = tex3Dfetch(samplerDownscaled, uint3(tid.xy,tid.z)).r;
+    float nextCloseness = tex3Dfetch(samplerDownscaled, uint3(tid.xy,tid.z+ASCIIAlternatives/2)).r;
+    int result = nextCloseness < prevCloseness;
+    uint sharedAddr = gid.x*ASCIIAlternatives/2*PatchSizeBestASCII + gid.y*ASCIIAlternatives/2 + gid.z;
+    Closeness[sharedAddr] = prevCloseness*(1-result) + nextCloseness*result;
+    IClosest[sharedAddr] = result*ASCIIAlternatives/2 + gid.z;
+    [unroll]
+    for (uint i = ASCIIAlternatives/4; i > 0; i>>=1 ) {
+		groupMemoryBarrier();
+        int isCloser = Closeness[sharedAddr + i] < Closeness[sharedAddr];
+        // int isCloser = true;
+        Closeness[sharedAddr] = Closeness[sharedAddr]*(1-isCloser) + Closeness[sharedAddr + i]*isCloser;
+        IClosest[sharedAddr] = IClosest[sharedAddr]*(1-isCloser) + IClosest[sharedAddr + i]*isCloser;
+        // uint3 newInd = uint3(tid.xy, i);
+        // float newCloseness = tex3Dfetch(samplerDownscaled, newInd).r;
+        // if (newCloseness < prevCloseness) {
+        //     prevCloseness = newCloseness;
+        //     result = i;
+        // }
     }
-	uint charIdx = result + (uint)tex2Dfetch(samplerDownscaledLumi, tid.xy);
-    tex2Dstore(s_BestASCII, tid.xy, (float)charIdx);
+	uint charIdx = IClosest[sharedAddr] + (uint)tex2Dfetch(samplerDownscaledLumi, tid.xy);
+    if ( gid.z==0 ) {
+        tex2Dstore(s_BestASCII, tid.xy, (float)charIdx);
+    }
 }
 
 void ComputeASCIIRender(uint3 id : SV_GROUPID, uint3 gid : SV_GROUPTHREADID) {
@@ -259,7 +287,7 @@ technique ASCII_FECT < ui_label= "Fine ASCII"; ui_tooltip = "Replace image with 
 
     // Character matching
     pass {
-        ComputeShader = ComputeASCIICloseness<ASCIIWidth,ASCIIHeight>;
+        ComputeShader = ComputeASCIICloseness<ASCIIWidth,ASCIIHeight,1>;
         DispatchSizeX = BUFFER_WIDTH / ASCIIWidth;
         DispatchSizeY = BUFFER_HEIGHT / ASCIIHeight;
         DispatchSizeZ = ASCIIAlternatives;
@@ -275,22 +303,17 @@ technique ASCII_FECT < ui_label= "Fine ASCII"; ui_tooltip = "Replace image with 
 
     // scan for the best match inside each character
     pass {
-        ComputeShader = ComputeBestASCII<ASCIIWidth,ASCIIHeight>;
-        DispatchSizeX = BUFFER_WIDTH / ASCIIWidth*ASCIIWidth;
-        DispatchSizeY = BUFFER_HEIGHT / ASCIIHeight*ASCIIHeight;
+        ComputeShader = ComputeBestASCII;
+        DispatchSizeX = BUFFER_WIDTH / (ASCIIWidth*PatchSizeBestASCII);
+        DispatchSizeY = BUFFER_HEIGHT / (ASCIIHeight*PatchSizeBestASCII);
     }
 
-    // render
+    // rendering results
     pass {
         ComputeShader = ComputeASCIIRender<ASCIIWidth,ASCIIHeight>;
         DispatchSizeX = BUFFER_WIDTH / ASCIIWidth;
         DispatchSizeY = BUFFER_HEIGHT / ASCIIHeight;
     }
-    // pass {
-    //     ComputeShader = ComputeGrayscale<8,8>;
-    //     DispatchSizeX = BUFFER_WIDTH / 8;
-    //     DispatchSizeY = BUFFER_HEIGHT / 8;
-    // }
     pass {
         VertexShader = FullWindow;
         PixelShader = PixelRender;
