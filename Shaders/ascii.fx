@@ -170,8 +170,13 @@ void ComputeDownscaleLumi(uint3 gid : SV_GROUPTHREADID, uint3 id : SV_GROUPID) {
 		reductionBuffer[sharedAddr] += reductionBuffer[sharedAddr + i];
 	}
 
+    float qluminosity = clamp(
+        0.5 + reductionBuffer[0] * (ASCIICharacters - ASCIIAlternatives)/ASCIICharacters,
+        0.0,
+        ASCIICharacters - ASCIIAlternatives
+    );
     if (sharedAddr == 0) {
-        tex2Dstore(s_DownscaledLumi, id.xy, 0.5 + reductionBuffer[0] * (ASCIICharacters - ASCIIAlternatives)/ASCIICharacters);
+        tex2Dstore(s_DownscaledLumi, id.xy, qluminosity);
     }
 }
 
